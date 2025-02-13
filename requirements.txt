@@ -1,0 +1,6 @@
+cython
+pycocotools
+scipy
+loguru
+tabulate
+timm

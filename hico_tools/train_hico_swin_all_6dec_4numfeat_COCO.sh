@@ -1,0 +1,1 @@
+torchrun main.py --batch_size 2 --backbone swin_tiny --resume ./params/swin_tiny_iterative_box_refinement_COCO.pth --output_dir hico_logs/all_flow --epochs 100 --lr_drop 60 --num_feature_levels 4 --num_queries 128 --use_nms
