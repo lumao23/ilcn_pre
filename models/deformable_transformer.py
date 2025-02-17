@@ -136,12 +136,12 @@ class DeformableTransformer(nn.Module):
         init_reference_out = reference_points
 
         # decoder
-        h_hs, o_hs, rel_hs, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes,
+        h_hs, o_hs, rel_hs, layout, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes,
                                                                     level_start_index, valid_ratios, query_embed,
                                                                     mask_flatten)
         
         inter_references_out = inter_references
-        return h_hs, o_hs, rel_hs, init_reference_out, inter_references_out
+        return h_hs, o_hs, rel_hs, layout, init_reference_out, inter_references_out
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -275,7 +275,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         return tgt
 
-
+# relation decoder layer
 class RelDeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model=256, d_ffn=1024,
                  dropout=0.1, activation="relu",
@@ -330,16 +330,18 @@ class RelDeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm5(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index,
+    def forward(self, tgt, query_pos, lay_out, reference_points, src, src_spatial_shapes, level_start_index,
                 src_padding_mask=None):
         # layout_ffn
         query_pos = self.layout_ffn(query_pos)
+        query_pos = (query_pos + lay_out)/2
 
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
         tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+        lay_output = tgt.clone()
 
         # cross attention
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
@@ -351,7 +353,7 @@ class RelDeformableTransformerDecoderLayer(nn.Module):
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        return tgt, lay_output
 
 class DeformableTransformerDecoder(nn.Module):
     def __init__(self, decoder_layer, rel_layer, num_layers, return_intermediate=False):
@@ -370,6 +372,7 @@ class DeformableTransformerDecoder(nn.Module):
         intermediate_sub = []
         intermediate_obj = []
         intermediate_rel = []
+        intermediate_lay = []
         intermediate_reference_points = []
         feat_w, feat_h = src_spatial_shapes[-1][0], src_spatial_shapes[-1][1]
         for lid in range(self.num_layers):
@@ -420,13 +423,16 @@ class DeformableTransformerDecoder(nn.Module):
             # handcrafted layout relation
             lay_inp = spatial_encodings(sub_box, obj_box, (feat_w, feat_h)).reshape(bs, queries // 2, -1)
 
-            # relation reference input
+            # mean relation reference input
             rel_refer_input = (reference_points_input[:,:queries //2] + reference_points_input[:,queries //2:])/2
+            if lid == 0:
+                lay_out = torch.zeros_like(rel_inp)
 
-            # relation 
-            rel_out = self.rel_layers[lid](
+            # relation
+            rel_out, lay_out = self.rel_layers[lid](
                 rel_inp,
                 lay_inp,
+                lay_out,
                 rel_refer_input,
                 src,
                 src_spatial_shapes,
@@ -438,13 +444,14 @@ class DeformableTransformerDecoder(nn.Module):
                 intermediate_sub.append(h_hs)
                 intermediate_obj.append(o_hs)
                 intermediate_rel.append(rel_out)
+                intermediate_lay.append(lay_out)
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
             return torch.stack(intermediate_sub), torch.stack(intermediate_obj), torch.stack(intermediate_rel), \
-                 torch.stack(intermediate_reference_points)
+                torch.stack(intermediate_rel), torch.stack(intermediate_reference_points)
 
-        return h_hs, o_hs, rel_out, reference_points
+        return h_hs, o_hs, rel_out, lay_out, reference_points
 
 
 def _get_clones(module, N):

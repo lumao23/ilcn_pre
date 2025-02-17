@@ -185,10 +185,11 @@ class PA2LG(nn.Module):
 
         # query_embeds = torch.cat([self.query_emb.weight, torch.cat([self.pos_query.weight, self.pos_query.weight],dim=0)], dim=1)
         query_embeds = self.query_embed.weight
-        h_hs, o_hs, rel_hs, init_reference, inter_references = self.transformer(srcs, masks, pos, query_embeds)
+        h_hs, o_hs, rel_hs, layout, init_reference, inter_references = self.transformer(srcs, masks, pos, query_embeds)
 
         outputs_classes = []
         outputs_verb_classes = []
+        outputs_layout_guides = []
         outputs_coords = []
         outputs_sub_coords = []
         layer, bs, query, dims = h_hs.shape
@@ -201,6 +202,7 @@ class PA2LG(nn.Module):
             reference = inverse_sigmoid(reference)
             outputs_class = self.class_embed[lvl](o_hs[lvl])
             outputs_verb_class = self.verb_class_embed[lvl](rel_hs[lvl])
+            outputs_layout_guide = self.spatial_embed[lvl](layout[lvl])
             tmp_sub = self.sub_embed[lvl](h_hs[lvl])
             tmp = self.obj_embed[lvl](o_hs[lvl])
             tmp_cat = torch.cat([tmp_sub,tmp], dim=1)
@@ -212,19 +214,21 @@ class PA2LG(nn.Module):
             outputs_coord = tmp_cat.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_verb_classes.append(outputs_verb_class)
+            outputs_layout_guides.append(outputs_layout_guide)
             outputs_coords.append(outputs_coord[...,query:,:])
             outputs_sub_coords.append(outputs_coord[...,:query,:])
             reference = reference.sigmoid()
-        
+
         # layout feature guide verb
-        outputs_verb_class = torch.stack(outputs_verb_classes) 
+        outputs_layout_guide = torch.stack(outputs_layout_guides)
+        outputs_verb_class = torch.stack(outputs_verb_classes) + outputs_layout_guide
 
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
         outputs_sub_coord = torch.stack(outputs_sub_coords)
 
-        torch.save(inter_references[-1], 'point.pth')
-        torch.save({'sub': outputs_sub_coord, 'obj': outputs_coord, 'verb': outputs_verb_class}, "box.pth")
+        # torch.save(inter_references[-1], 'point.pth')
+        # torch.save({'sub': outputs_sub_coord, 'obj': outputs_coord, 'verb': outputs_verb_class}, "box.pth")
 
         out = {'pred_obj_logits': outputs_class[-1], 'pred_obj_boxes': outputs_coord[-1],
                'pred_verb_logits': outputs_verb_class[-1], 'pred_sub_boxes': outputs_sub_coord[-1]}
