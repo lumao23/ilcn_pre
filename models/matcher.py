@@ -16,8 +16,7 @@ from torch import nn
 
 from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 
-
-class HungarianMatcherHOI(nn.Module):
+class HungarianMatcherHOI(nn.Module):                            
 
     def __init__(self, cost_obj_class: float = 1, cost_verb_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1,
                  no_obj: bool = False):

@@ -1,0 +1,26 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "main",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--batch_size","2",
+                "--backbone", "swin_tiny",
+                "--resume", "./params/swin_tiny_iterative_box_refinement_COCO.pth",
+                "--output_dir", "hico_logs/all_flow",
+                "--epochs", "100",
+                "--lr_drop", "60",
+                "--num_feature_levels", "4",
+                "--num_queries", "128",
+                "--use_nms"
+            ]
+        }
+    ]
+}

@@ -20,6 +20,7 @@ from util.misc import inverse_sigmoid
 from models.ops.modules import MSDeformAttn
 from util.box_ops import spatial_encodings, box_cxcywh_to_xyxy
 
+
 def _nms(heat, kernel=3):
     pad = (kernel - 1) // 2
 
@@ -62,14 +63,14 @@ class DeformableTransformer(nn.Module):
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points)
+        
+        self.ins_decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers,
+                                                    return_intermediate=return_intermediate_dec)
 
-        # rel_decoder_layer = TransformerDecoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
-        rel_decoder_layer = RelDeformableTransformerDecoderLayer(d_model, dim_feedforward,
-                                                          dropout, activation,
-                                                          num_feature_levels, nhead, dec_n_points)
+        rel_decoder_layer = TransformerDecoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
 
-        self.decoder = DeformableTransformerDecoder(decoder_layer, rel_decoder_layer, num_decoder_layers,
-                                                    return_intermediate_dec)
+        self.rel_decoder = TransformerDecoder(rel_decoder_layer, num_decoder_layers,
+                                                    return_intermediate=return_intermediate_dec)
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
 
@@ -99,6 +100,7 @@ class DeformableTransformer(nn.Module):
 
     def forward(self, srcs, masks, pos_embeds, query_embed=None):
         assert query_embed is not None
+
         # prepare input for encoder
         src_flatten = []
         mask_flatten = []
@@ -125,23 +127,47 @@ class DeformableTransformer(nn.Module):
         # encoder
         memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten,
                               mask_flatten)
-        
+
         # prepare input for decoder
         bs, _, c = memory.shape
         query_embed, tgt = torch.split(query_embed, c, dim=1)
+
+        queries = query_embed.shape[0]
 
         query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
         tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
         reference_points = self.reference_points(query_embed).sigmoid()
         init_reference_out = reference_points
 
-        # decoder
-        h_hs, o_hs, rel_hs, layout, inter_references = self.decoder(tgt, reference_points, memory, spatial_shapes,
+        # ins decoder
+        output, reference_out = self.ins_decoder(tgt, reference_points, memory, spatial_shapes,
                                                                     level_start_index, valid_ratios, query_embed,
                                                                     mask_flatten)
         
-        inter_references_out = inter_references
-        return h_hs, o_hs, rel_hs, layout, init_reference_out, inter_references_out
+        # spatial relation
+        boxes = box_cxcywh_to_xyxy(reference_out)
+        sub_out = output[:, :, :queries // 2, :]
+        obj_out = output[:, :, queries // 2:, :]
+        sub_box = boxes[:, :, :queries // 2, :]
+        obj_box = boxes[:, :, queries // 2:, :]
+        nlayer, bs, nq, bx_d = sub_box.shape
+        spatial_relation = spatial_encodings(sub_box.reshape(nlayer*bs,nq,bx_d), obj_box.reshape((nlayer*bs,nq,bx_d)), spatial_shape).reshape(nlayer, bs, nq, -1)
+
+        # hoi queries
+        hoi_queries = sub_out + obj_out.detach()
+        hoi_zero_queries = torch.zeros_like(hoi_queries[0])
+        spatial_queries = torch.zeros_like(hoi_zero_queries)
+
+        rel_out, lay_out = self.rel_decoder(                
+            hoi_queries,
+            hoi_zero_queries,
+            spatial_relation,
+            spatial_queries,
+            memory[..., level_start_index[-1]:, :]
+            )
+
+        inter_references_out = reference_out
+        return sub_out, obj_out, rel_out, lay_out, init_reference_out, inter_references_out
 
 
 class DeformableTransformerEncoderLayer(nn.Module):
@@ -240,10 +266,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.linear2 = nn.Linear(d_ffn, d_model)
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
-        
-        # concate
-        self.linear_pro = nn.Linear(d_model, d_model//2)
-        self.linear_lay = nn.Linear(d_model, d_model//2)
 
     def with_pos_embed(self, tensor, pos):
         # clearly addition
@@ -275,91 +297,11 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         return tgt
 
-# relation decoder layer
-class RelDeformableTransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model=256, d_ffn=1024,
-                 dropout=0.1, activation="relu",
-                 n_levels=4, n_heads=8, n_points=4):
-        super().__init__()
-
-        # cross attention
-        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-
-        # self attention
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        # ffn
-        self.linear1 = nn.Linear(d_model, d_ffn)
-        self.activation = _get_activation_fn(activation)
-        self.dropout3 = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(d_ffn, d_model)
-        self.dropout4 = nn.Dropout(dropout)
-        self.norm3 = nn.LayerNorm(d_model)
-
-        # layout features extract
-        self.linear3 = nn.Linear(36, d_model)
-        self.norm4 = nn.LayerNorm(d_model)
-        self.linear4 = nn.Linear(d_model, d_ffn)
-        self.dropout5 = nn.Dropout(dropout)
-        self.linear5 = nn.Linear(d_ffn, d_model)
-        self.dropout6 = nn.Dropout(dropout)
-        self.norm5 = nn.LayerNorm(d_model)
-        
-        # concate
-        self.linear_pro = nn.Linear(d_model, d_model//2)
-        self.linear_lay = nn.Linear(d_model, d_model//2)
-
-    def with_pos_embed(self, tensor, pos):
-        # clearly addition
-        return tensor if pos is None else tensor + pos
-
-    def forward_ffn(self, tgt):
-        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout4(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
-    
-    def layout_ffn(self, tgt):
-        tgt = self.norm4(self.linear3(tgt))
-        tgt2 = self.linear5(self.dropout5(self.activation(self.linear4(tgt))))
-        tgt = tgt + self.dropout6(tgt2)
-        tgt = self.norm5(tgt)
-        return tgt
-
-    def forward(self, tgt, query_pos, lay_out, reference_points, src, src_spatial_shapes, level_start_index,
-                src_padding_mask=None):
-        # layout_ffn
-        query_pos = self.layout_ffn(query_pos)
-        query_pos = (query_pos + lay_out)/2
-
-        # self attention
-        q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-        lay_output = tgt.clone()
-
-        # cross attention
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),
-                               reference_points,
-                               src, src_spatial_shapes, level_start_index, src_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-
-        # ffn
-        tgt = self.forward_ffn(tgt)
-
-        return tgt, lay_output
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, rel_layer, num_layers, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
-        self.rel_layers = _get_clones(rel_layer, num_layers)
         self.num_layers = num_layers
         self.return_intermediate = return_intermediate
         self.sub_embed = None
@@ -369,10 +311,7 @@ class DeformableTransformerDecoder(nn.Module):
                 query_pos=None, src_padding_mask=None):
         output = tgt
         bs, queries, dims = output.shape
-        intermediate_sub = []
-        intermediate_obj = []
-        intermediate_rel = []
-        intermediate_lay = []
+        intermediate_ins = []
         intermediate_reference_points = []
         feat_w, feat_h = src_spatial_shapes[-1][0], src_spatial_shapes[-1][1]
         for lid in range(self.num_layers):
@@ -413,45 +352,170 @@ class DeformableTransformerDecoder(nn.Module):
             reference_points = new_reference_points.detach()
 
             # new_reference_points are the boxes of sub and obj
-            boxes = box_cxcywh_to_xyxy(new_reference_points)
-            sub_box = boxes[:, :queries // 2, :]
-            obj_box = boxes[:, queries // 2:, :]
+            # boxes = box_cxcywh_to_xyxy(new_reference_points)
+            # sub_box = boxes[:, :queries // 2, :]
+            # obj_box = boxes[:, queries // 2:, :]
 
-            # obj_cls_detach
-            rel_inp = h_hs + o_hs.detach()
+            # rel_inp = h_hs + o_hs.detach()
 
-            # handcrafted layout relation
-            lay_inp = spatial_encodings(sub_box, obj_box, (feat_w, feat_h)).reshape(bs, queries // 2, -1)
-
-            # mean relation reference input
-            rel_refer_input = (reference_points_input[:,:queries //2] + reference_points_input[:,queries //2:])/2
-            if lid == 0:
-                lay_out = torch.zeros_like(rel_inp)
-
-            # relation
-            rel_out, lay_out = self.rel_layers[lid](
-                rel_inp,
-                lay_inp,
-                lay_out,
-                rel_refer_input,
-                src,
-                src_spatial_shapes,
-                src_level_start_index,
-                src_padding_mask,
-            )
+            # # handcrafted layout relation
+            # lay_inp = spatial_encodings(sub_box, obj_box, (feat_w, feat_h)).reshape(bs, queries // 2, -1)
+            # if lid == 0:
+            #     lay_out = torch.zeros_like(rel_inp)
+            #     rel_out = torch.zeros_like(rel_inp)
+            # rel_out, lay_out = self.rel_layers[lid](
+            #     rel_out,
+            #     rel_inp,
+            #     lay_inp,
+            #     lay_out,
+            #     src,
+            #     src_level_start_index,
+            # )
 
             if self.return_intermediate:
-                intermediate_sub.append(h_hs)
-                intermediate_obj.append(o_hs)
-                intermediate_rel.append(rel_out)
-                intermediate_lay.append(lay_out)
+                intermediate_ins.append(output)
                 intermediate_reference_points.append(reference_points)
 
         if self.return_intermediate:
-            return torch.stack(intermediate_sub), torch.stack(intermediate_obj), torch.stack(intermediate_rel), \
-                torch.stack(intermediate_rel), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate_ins), torch.stack(intermediate_reference_points)
 
-        return h_hs, o_hs, rel_out, lay_out, reference_points
+        return output, reference_points
+
+class TransformerDecoder(nn.Module):
+
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+        self.return_intermediate = return_intermediate
+
+    def forward(self, 
+                tgt,
+                tgt_lst,
+                query_pos,
+                query_lst,
+                memory):
+        output = tgt_lst
+        layout = query_lst
+
+        intermediate = []
+        intermediate_lay = []
+        for i, layer in enumerate(self.layers):
+            hoi_queries_pos = tgt[i]
+            spatial_pos = query_pos[i]
+            output, layout = layer(
+                hoi_queries_pos,
+                output,
+                spatial_pos,
+                layout,
+                memory)
+            if self.return_intermediate:
+                intermediate.append(output)
+                intermediate_lay.append(layout)
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(intermediate_lay)
+
+        return output,layout
+
+class TransformerDecoderLayer(nn.Module):
+    """interaction branch"""
+    def __init__(
+            self,
+            d_model=256,
+            d_ffn=1024,
+            dropout=0.1,
+            activation="relu",
+            n_heads=8,
+    ):
+        super().__init__()
+
+        # self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+
+        # cross attention
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # ffn
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout3 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        # layout features extract
+        self.linear3 = nn.Linear(36, d_model)
+        self.norm4 = nn.LayerNorm(d_model)
+        self.linear4 = nn.Linear(d_model, d_ffn)
+        self.dropout5 = nn.Dropout(dropout)
+        self.linear5 = nn.Linear(d_ffn, d_model)
+        self.dropout6 = nn.Dropout(dropout)
+        self.norm5 = nn.LayerNorm(d_model)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout4(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+    def layout_ffn(self, tgt):
+        tgt = self.norm4(self.linear3(tgt))
+        tgt2 = self.linear5(self.dropout5(self.activation(self.linear4(tgt))))
+        tgt = tgt + self.dropout6(tgt2)
+        tgt = self.norm5(tgt)
+        return tgt
+
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def forward(
+            self,
+            tgt,
+            tgt_lst,
+            query_pos,
+            query_lst,
+            memory,
+            self_attn_mask=None,
+    ):
+        # layout ffn
+        query_pos = self.layout_ffn(query_pos)
+
+        # fuse to update
+        tgt = (tgt + tgt_lst) / 2
+        query_pos = (query_pos + query_lst) / 2
+
+        # self attention
+        q = k = self.with_pos_embed(tgt, query_pos)
+        tgt2 = self.self_attn(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            tgt.transpose(0, 1),
+            attn_mask=self_attn_mask,
+        )[0].transpose(0, 1)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        lay_out = tgt
+
+        # cross attention
+        tgt2 = self.cross_attn(
+            self.with_pos_embed(tgt, query_pos).transpose(0, 1),
+            memory.transpose(0, 1),
+            memory.transpose(0, 1),
+        )[0].transpose(0, 1)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # ffn
+        tgt = self.forward_ffn(tgt)
+        return tgt, lay_out
 
 
 def _get_clones(module, N):

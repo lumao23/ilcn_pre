@@ -124,7 +124,7 @@ class PA2LG(nn.Module):
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
 
-        num_pred = transformer.decoder.num_layers
+        num_pred = transformer.ins_decoder.num_layers
 
         nn.init.constant_(self.sub_embed.layers[-1].bias.data[2:], -2.0)
         nn.init.constant_(self.obj_embed.layers[-1].bias.data[2:], -2.0)
@@ -139,8 +139,8 @@ class PA2LG(nn.Module):
         self.obj_embed = nn.ModuleList([self.obj_embed for _ in range(num_pred)])
 
         # iterative synchronized refine
-        self.transformer.decoder.sub_embed = self.sub_embed
-        self.transformer.decoder.obj_embed = self.obj_embed
+        self.transformer.ins_decoder.sub_embed = self.sub_embed
+        self.transformer.ins_decoder.obj_embed = self.obj_embed
 
     def forward(self, samples: NestedTensor):
         """ 
