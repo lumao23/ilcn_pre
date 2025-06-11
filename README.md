@@ -1,14 +1,14 @@
-# ILCN
+# ILCNv2
 This page is the code of our paper (in submission) "Intra-and-inter Instance Location Correlation Network for Human Object Interaction Detection".
 
 ![image](pictures/ILCN.jpg)
 
 ## Installation
-Our model is run under ```CUDA>=9.2, GCC>=5.4,Python>=3.7  ```. Other versions might be available as well.
+Our model is run under ```CUDA==12.4, GCC>=6,Python>=3.8  ```. Other versions might be available as well.
 
 1. Clone this repo
 ```sh
-git clone https://github.com/lumao23/ILCN.git
+git clone https://github.com/lumao23/ilcn_pre.git
 cd ILCN
 ```
 
@@ -17,7 +17,7 @@ cd ILCN
 conda create -n ILCN python=3.8
 conda activate ILCN
 pip install -r requirements.txt
-conda install pytorch==1.11.0 torchvision==0.12.0 torchaudio==0.11.0 cudatoolkit=11.3 -c pytorch
+pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 ```
 Or you can follow the instruction on https://pytorch.org/get-started/locally/ for another pytorch version
 
