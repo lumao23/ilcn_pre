@@ -11,16 +11,17 @@
             "program": "${workspaceFolder}/main.py",
             "console": "externalTerminal",
             "args": [
-                "--batch_size","2",
+                "--batch_size","1",
                 "--backbone", "swin_tiny",
-                "--resume", "./params/swin_tiny_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage_36eps.pth",
+                "--resume", "./resume/checkpoint0097.pth",
                 "--output_dir", "hico_logs/all_flow",
                 "--epochs", "100",
                 "--lr_drop", "60",
                 "--num_feature_levels", "4",
                 "--num_queries", "128",
-                "--dec_layers", "3",
-                "--use_nms"
+                "--dec_layers", "6",
+                "--use_nms",
+                "--eval"
             ]
         }
     ]

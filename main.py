@@ -73,7 +73,7 @@ def get_args_parser():
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
-    parser.add_argument('--dim_feedforward', default=2048, type=int,
+    parser.add_argument('--dim_feedforward', default=1024, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
     parser.add_argument('--hidden_dim', default=256, type=int,
                         help="Size of the embeddings (dimension of the transformer)")
@@ -186,6 +186,7 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
+    
 
     if args.output_dir and utils.get_rank() == 0:
         logger.info("\n{}".format(model))

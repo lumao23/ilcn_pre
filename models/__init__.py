@@ -7,7 +7,7 @@
 # Copyright (c) 2020 SenseTime. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from .hoi import build
+from .QAHOI import build
 
 
 def build_model(args):
