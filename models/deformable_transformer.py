@@ -337,6 +337,7 @@ class DeformableTransformerDecoder(nn.Module):
             sub_box = boxes[:, :queries // 2, :]
             obj_box = boxes[:, queries // 2:, :]
 
+            # detach ！！！！！
             rel_inp = h_hs + o_hs.detach()
 
             # handcrafted layout relation
