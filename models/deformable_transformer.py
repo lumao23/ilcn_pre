@@ -64,7 +64,7 @@ class DeformableTransformer(nn.Module):
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points)
         
-        self.ins_decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers,
+        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers,
                                                     return_intermediate=return_intermediate_dec)
 
         rel_decoder_layer = TransformerDecoderLayer(d_model, dim_feedforward, dropout, activation, nhead)
@@ -88,6 +88,75 @@ class DeformableTransformer(nn.Module):
         xavier_uniform_(self.reference_points.weight.data, gain=1.0)
         constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
+
+    def get_proposal_pos_embed(self, proposals):
+        num_pos_feats = 128
+        temperature = 10000
+        scale = 2 * math.pi
+
+        dim_t = torch.arange(
+            num_pos_feats, dtype=torch.float32, device=proposals.device
+        )
+        dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+        # N, L, 4
+        proposals = proposals.sigmoid() * scale
+        # N, L, 4, 128
+        pos = proposals[:, :, :, None] / dim_t
+        # N, L, 4, 64, 2
+        pos = torch.stack(
+            (pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()), dim=4
+        ).flatten(2)
+        return pos
+
+    def gen_encoder_output_proposals(self, memory, memory_padding_mask, spatial_shapes):
+        N_, S_, C_ = memory.shape
+        base_scale = 4.0
+        proposals = []
+        _cur = 0
+        for lvl, (H_, W_) in enumerate(spatial_shapes):
+            mask_flatten_ = memory_padding_mask[:, _cur : (_cur + H_ * W_)].view(
+                N_, H_, W_, 1
+            )
+            valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
+            valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
+
+            grid_y, grid_x = torch.meshgrid(
+                torch.linspace(
+                    0, H_ - 1, H_, dtype=torch.float32, device=memory.device
+                ),
+                torch.linspace(
+                    0, W_ - 1, W_, dtype=torch.float32, device=memory.device
+                ),
+            )
+            grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
+
+            scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(
+                N_, 1, 1, 2
+            )
+            grid = (grid.unsqueeze(0).expand(N_, -1, -1, -1) + 0.5) / scale
+            wh = torch.ones_like(grid) * 0.05 * (2.0 ** lvl)
+            proposal = torch.cat((grid, wh), -1).view(N_, -1, 4)
+            proposals.append(proposal)
+            _cur += H_ * W_
+        output_proposals = torch.cat(proposals, 1)
+        output_proposals_valid = (
+            (output_proposals > 0.01) & (output_proposals < 0.99)
+        ).all(-1, keepdim=True)
+        output_proposals = torch.log(output_proposals / (1 - output_proposals))
+        output_proposals = output_proposals.masked_fill(
+            memory_padding_mask.unsqueeze(-1), float("inf")
+        )
+        output_proposals = output_proposals.masked_fill(
+            ~output_proposals_valid, float("inf")
+        )
+
+        output_memory = memory
+        output_memory = output_memory.masked_fill(
+            memory_padding_mask.unsqueeze(-1), float(0)
+        )
+        output_memory = output_memory.masked_fill(~output_proposals_valid, float(0))
+        output_memory = self.enc_output_norm(self.enc_output(output_memory))
+        return output_memory, output_proposals
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -130,6 +199,48 @@ class DeformableTransformer(nn.Module):
 
         # prepare input for decoder
         bs, _, c = memory.shape
+        
+        if self.two_stage:
+
+            output_memory, output_proposals = self.gen_encoder_output_proposals(
+                memory, mask_flatten, spatial_shapes
+            )
+
+            # hack implementation for two-stage Deformable DETR
+            enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](
+                output_memory
+            )
+            enc_outputs_coord_unact = (
+                self.decoder.bbox_embed[self.decoder.num_layers](output_memory)
+                + output_proposals
+            )
+
+            topk = self.two_stage_num_proposals = 128
+            topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
+            topk_coords_unact = torch.gather(
+                enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
+            )
+            topk_coords_unact = topk_coords_unact.detach()
+            reference_points = topk_coords_unact.sigmoid()
+            init_reference_out = reference_points
+            pos_trans_out = self.pos_trans_norm(
+                self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact))
+            )
+
+            if not self.mixed_selection:
+                query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+            else:
+                # query_embed here is the content embed for deformable DETR
+                tgt = query_embed.unsqueeze(0).expand(bs, -1, -1)
+                query_embed, _ = torch.split(pos_trans_out, c, dim=2)
+        else:
+            query_embed, tgt = torch.split(query_embed, c, dim=1)
+            query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
+            tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            reference_points = self.reference_points(query_embed).sigmoid()
+            init_reference_out = reference_points
+        
+        
         query_embed, tgt = torch.split(query_embed, c, dim=1)
 
         queries = query_embed.shape[0]
@@ -140,18 +251,18 @@ class DeformableTransformer(nn.Module):
         init_reference_out = reference_points
 
         # ins decoder
-        output, reference_out = self.ins_decoder(tgt, reference_points, memory, spatial_shapes,
+        output, reference_out, spatial_reference = self.ins_decoder(tgt, reference_points, memory, spatial_shapes,
                                                                     level_start_index, valid_ratios, query_embed,
                                                                     mask_flatten)
         
         # spatial relation
-        boxes = box_cxcywh_to_xyxy(reference_out)
+        boxes = box_cxcywh_to_xyxy(spatial_reference)
         sub_out = output[:, :, :queries // 2, :]
         obj_out = output[:, :, queries // 2:, :]
         sub_box = boxes[:, :, :queries // 2, :]
         obj_box = boxes[:, :, queries // 2:, :]
         nlayer, bs, nq, bx_d = sub_box.shape
-        spatial_relation = spatial_encodings(sub_box.reshape(nlayer*bs,nq,bx_d), obj_box.reshape((nlayer*bs,nq,bx_d)), spatial_shape).reshape(nlayer, bs, nq, -1)
+        spatial_relation = spatial_encodings(sub_box.reshape(nlayer*bs,nq,bx_d), obj_box.reshape(nlayer*bs,nq,bx_d), spatial_shape).reshape(nlayer, bs, nq, -1)
 
         # hoi queries
         hoi_queries = sub_out + obj_out.detach()
@@ -306,6 +417,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.return_intermediate = return_intermediate
         self.sub_embed = None
         self.obj_embed = None
+        self.c
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
                 query_pos=None, src_padding_mask=None):
@@ -313,6 +425,7 @@ class DeformableTransformerDecoder(nn.Module):
         bs, queries, dims = output.shape
         intermediate_ins = []
         intermediate_reference_points = []
+        intermediate_spa = []
         feat_w, feat_h = src_spatial_shapes[-1][0], src_spatial_shapes[-1][1]
         for lid in range(self.num_layers):
             if reference_points.shape[-1] == 4:
@@ -375,11 +488,12 @@ class DeformableTransformerDecoder(nn.Module):
             if self.return_intermediate:
                 intermediate_ins.append(output)
                 intermediate_reference_points.append(reference_points)
+                intermediate_spa.append(new_reference_points)
 
         if self.return_intermediate:
-            return torch.stack(intermediate_ins), torch.stack(intermediate_reference_points)
+            return torch.stack(intermediate_ins), torch.stack(intermediate_reference_points), torch.stack(intermediate_spa)
 
-        return output, reference_points
+        return output, reference_points, new_reference_points
 
 class TransformerDecoder(nn.Module):
 

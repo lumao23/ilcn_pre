@@ -5,20 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "main",
+            "name": "asdfad",
             "type": "debugpy",
             "request": "launch",
-            "program": "main.py",
-            "console": "integratedTerminal",
+            "program": "${workspaceFolder}/main.py",
+            "console": "externalTerminal",
             "args": [
                 "--batch_size","2",
                 "--backbone", "swin_tiny",
-                "--resume", "./params/swin_tiny_iterative_box_refinement_COCO.pth",
+                "--resume", "./params/swin_tiny_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage_36eps.pth",
                 "--output_dir", "hico_logs/all_flow",
                 "--epochs", "100",
                 "--lr_drop", "60",
                 "--num_feature_levels", "4",
                 "--num_queries", "128",
+                "--dec_layers", "3",
                 "--use_nms"
             ]
         }
